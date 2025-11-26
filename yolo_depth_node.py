@@ -15,10 +15,10 @@ class YOLODepthNode(Node):
         self.bridge = CvBridge()
 
         # 相机内参默认值
-        self.fx = 386.005
-        self.fy = 386.005
-        self.cx = 318.554
-        self.cy = 235.491
+        self.fx = 607.0194091796875
+        self.fy = 606.4129638671875
+        self.cx = 323.3750915527344
+        self.cy = 255.79656982421875
         self.camera_info_received = False
         self.depth_image = None
 
@@ -41,6 +41,8 @@ class YOLODepthNode(Node):
 
         # 创建窗口并绑定鼠标点击事件
         cv2.namedWindow("YOLO detection", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("YOLO detection", 720, 720)
+
         cv2.setMouseCallback("YOLO detection", self.mouse_callback)
 
         # 定时器用于检查窗口关闭
@@ -62,6 +64,7 @@ class YOLODepthNode(Node):
         self.camera_info_received = True
         self.get_logger().info("Camera info received.")
         self.destroy_subscription(self.info_sub)  # 只读取一次
+        print(self.fx, self.fy, self.cx, self.cy)
 
     def depth_callback(self, msg):
         self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
@@ -114,7 +117,6 @@ class YOLODepthNode(Node):
                     X, Y, Z = self.current_coords[idx]
                     self.get_logger().info(f"Clicked box {idx} -> 3D: X:{X:.3f} Y:{Y:.3f} Z:{Z:.3f}")
                     break
-
 
 def main(args=None):
     rclpy.init(args=args)
