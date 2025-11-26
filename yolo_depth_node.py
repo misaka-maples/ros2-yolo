@@ -5,7 +5,7 @@ from cv_bridge import CvBridge
 import cv2
 import time
 from ultralytics import YOLO
-
+ 
 class YOLODepthNode(Node):
     def __init__(self):
         super().__init__('yolo_depth_node')
