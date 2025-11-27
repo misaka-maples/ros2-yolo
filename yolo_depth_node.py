@@ -6,7 +6,18 @@ import cv2
 import time
 import numpy as np
 from ultralytics import YOLO
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 
+# 定义适合实时、且允许丢帧的 QoS 配置文件
+# history=1: 队列只保留最新的一个消息
+# reliability=BEST_EFFORT: 不保证消息到达，减少重传开销
+# durability=VOLATILE: 消息不持久化，只对当前活跃的节点发送
+qos_profile = QoSProfile(
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,  # 队列深度设为1，来新消息时覆盖旧消息
+    reliability=ReliabilityPolicy.BEST_EFFORT, # 提高实时性，允许丢包
+    durability=DurabilityPolicy.VOLATILE
+)
 class YOLODepthNode(Node):
     def __init__(self):
         super().__init__('yolo_depth_node')
@@ -22,13 +33,15 @@ class YOLODepthNode(Node):
         self.cy = 255.79656982421875
         self.camera_info_received = False
         self.depth_image = None
+        
+        # 【新增】深度图平滑核大小 (必须是奇数)
+        self.depth_filter_size = 5 
 
         # 点击相关
         self.last_click_time = 0
         self.click_cooldown = 0.3
         
         # 存储当前显示的框，用于鼠标点击交互
-        # 格式: [{'box': [x1,y1,x2,y2], 'coords': (X,Y,Z), 'cls': 'name'}, ...]
         self.visible_detections = [] 
 
         # 安全退出标志
@@ -36,12 +49,11 @@ class YOLODepthNode(Node):
 
         # ROS2话题订阅
         self.color_sub = self.create_subscription(
-            Image, "/camera/camera/color/image_raw", self.color_callback, 10)
+            Image, "/camera/camera/color/image_raw", self.color_callback,  qos_profile=qos_profile)
         self.depth_sub = self.create_subscription(
-            Image, "/camera/camera/depth/image_rect_raw", self.depth_callback, 10)
+            Image, "/camera/camera/depth/image_rect_raw", self.depth_callback,  qos_profile=qos_profile)
         self.info_sub = self.create_subscription(
-            CameraInfo, "/camera/camera/color/camera_info", self.info_callback, 10)
-
+            CameraInfo, "/camera/camera/color/camera_info", self.info_callback,  qos_profile=qos_profile)
         # 创建窗口并绑定鼠标点击事件
         cv2.namedWindow("YOLO detection", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("YOLO detection", 720, 720)
@@ -50,7 +62,7 @@ class YOLODepthNode(Node):
         # 定时器用于检查窗口关闭
         self.create_timer(0.03, self.timer_callback)
 
-        self.get_logger().info("YOLO+Depth node started! (Class names + Overlap filter enabled)")
+        self.get_logger().info("YOLO+Depth node started! (Depth filter enabled)")
 
     def timer_callback(self):
         if cv2.getWindowProperty("YOLO detection", cv2.WND_PROP_VISIBLE) < 1:
@@ -63,17 +75,23 @@ class YOLODepthNode(Node):
         self.cx = msg.k[2]
         self.cy = msg.k[5]
         self.camera_info_received = True
-        self.get_logger().info(f"Camera info received: fx={self.fx}, fy={self.fy}, cx={self.cx}, cy={self.cy}")
+        self.get_logger().info(f"Camera info received: fx={self.fx}, fy={self.fy}")
         self.destroy_subscription(self.info_sub)
 
     def depth_callback(self, msg):
-        # 转换为opencv格式 (mm)
+        # 转换为opencv格式 (mm)，通常是 CV_16UC1 (np.uint16)
         self.depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding="passthrough")
+
+        # ====== 核心修改: 深度图平滑 ======
+        # 仅对有效的 16位深度图进行中值滤波
+        if self.depth_image is not None and self.depth_image.dtype == np.uint16:
+            # 使用中值滤波去除椒盐噪声和孤立的无效深度值，提高中心点采样的鲁棒性
+            self.depth_image = cv2.medianBlur(self.depth_image, self.depth_filter_size)
+        # ==================================
 
     def calculate_iou_contains(self, box_small, box_large):
         """
         计算小框有多少比例在大框内部。
-        返回: intersection_area / area_small
         """
         x1_s, y1_s, x2_s, y2_s = box_small
         x1_l, y1_l, x2_l, y2_l = box_large
@@ -134,7 +152,6 @@ class YOLODepthNode(Node):
 
                 ratio = self.calculate_iou_contains(raw_detections[i]['box'], raw_detections[j]['box'])
                 
-                # 如果小框 80% 以上的面积在大框内，则隐藏那个大框 (认为是背景或包含体)
                 if ratio > 0.8:
                     raw_detections[j]['hide'] = True
 
@@ -163,12 +180,9 @@ class YOLODepthNode(Node):
             depth_mm = self.depth_image[cy2d, cx2d]
             depth_m = depth_mm / 1000.0 
 
-            # ====== 核心修改: 过滤深度无效的检测框 ======
-            # 如果深度为 0 或接近 0 (表示无效测量、空洞或太近)，则跳过
+            # 过滤深度无效的检测框 (Z <= 0)
             if depth_m <= 0.001: 
-                self.get_logger().debug(f"Skipping '{cls_name}' at ({cx2d}, {cy2d}) due to invalid depth: {depth_m:.3f}m")
                 continue
-            # ============================================
 
             Z = depth_m
             X = (cx2d - self.cx) * Z / self.fx
@@ -182,16 +196,14 @@ class YOLODepthNode(Node):
             })
 
             # 绘图
-            # 框
             cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 1)
-            # 中心点
             cv2.circle(frame, (cx2d, cy2d), 3, (0, 0, 255), -1)
             
             # 文字标签 
             label = f"{cls_name} [{X:.2f}, {Y:.2f}, {Z:.2f}]m"
             t_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
             c2 = x1 + t_size[0], y1 - t_size[1] - 3
-            cv2.rectangle(frame, (x1, y1), c2, (0, 255, 0), -1, cv2.LINE_AA) # 填充文字背景
+            cv2.rectangle(frame, (x1, y1), c2, (0, 255, 0), -1, cv2.LINE_AA) 
             cv2.putText(frame, label, (x1, y1 - 2), 0, 0.5, (0, 0, 0), 1, lineType=cv2.LINE_AA)
 
         cv2.imshow("YOLO detection", frame)
@@ -208,7 +220,6 @@ class YOLODepthNode(Node):
             self.last_click_time = now
 
             clicked = False
-            # 遍历当前可见的框
             for item in self.visible_detections:
                 x1, y1, x2, y2 = item['box']
                 if x1 <= x <= x2 and y1 <= y <= y2:
